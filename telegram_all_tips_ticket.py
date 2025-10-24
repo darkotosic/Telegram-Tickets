@@ -25,13 +25,17 @@ RELAX_STEPS = 3
 RELAX_ADD = 0.03
 LEGS_MIN = 2
 LEGS_MAX = 5
-
-# Target odds for 4 tickets
 TARGETS = [2.0, 3.0, 4.0, 5.0]
 
 HEADERS = {"x-apisports-key": API_KEY}
 SKIP_STATUS = {"FT","AET","PEN","CANC","ABD","WO","PST","SUSP","INT","LIVE","ET"}
-ALLOW_LIST: set[int] = set()
+
+# ===== ALLOW LIST =====
+ALLOW_LIST: set[int] = {
+    2,3,913,5,536,808,960,10,667,29,30,31,32,37,33,34,848,311,310,342,218,144,315,71,
+    169,210,346,233,39,40,41,42,703,244,245,61,62,78,79,197,271,164,323,135,136,389,
+    88,89,408,103,104,106,94,283,235,286,287,322,140,141,113,207,208,202,203,909,268,269,270,340
+}
 
 # ============ BASE THRESHOLDS ============
 BASE_TH: Dict[Tuple[str,str], float] = {
@@ -95,7 +99,7 @@ def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
         fx = f.get("fixture", {}) or {}
         lg = f.get("league", {}) or {}
         st = (fx.get("status") or {}).get("short", "")
-        if st not in SKIP_STATUS and (not ALLOW_LIST or lg.get("id") in ALLOW_LIST):
+        if st not in SKIP_STATUS and lg.get("id") in ALLOW_LIST:
             fixtures.append(f)
         if len(fixtures) >= MAX_MATCHES:
             break
@@ -125,7 +129,6 @@ def best_market_odds(odds_resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
                 if not name:
                     continue
 
-                # Match Winner
                 if "Match Winner" in name or "1X2" in name:
                     for v in bet.get("values", []) or []:
                         val = (v.get("value") or "").strip()
@@ -135,7 +138,6 @@ def best_market_odds(odds_resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
                             put("Match Winner","Away",v.get("odd"))
                     continue
 
-                # Double Chance
                 if "Double Chance" in name:
                     for v in bet.get("values", []) or []:
                         val = (v.get("value") or "").replace(" ","").upper()
@@ -143,7 +145,6 @@ def best_market_odds(odds_resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
                             put("Double Chance",val,v.get("odd"))
                     continue
 
-                # Over/Under
                 if "Over/Under" in name or "Total Goals" in name:
                     for v in bet.get("values", []) or []:
                         val = (v.get("value") or "").strip().title()
@@ -151,7 +152,6 @@ def best_market_odds(odds_resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
                             put("Over/Under",val,v.get("odd"))
                     continue
 
-                # Team Totals
                 if "Home Team Goals" in name:
                     for v in bet.get("values",[]) or []:
                         val=(v.get("value") or "").strip()
@@ -165,7 +165,6 @@ def best_market_odds(odds_resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
                             put("Away Team Goals","Over 0.5",v.get("odd"))
                     continue
 
-                # First Half Goals
                 if "1st Half" in name:
                     for v in bet.get("values",[]) or []:
                         val=(v.get("value") or "").strip()
@@ -220,7 +219,7 @@ def best_leg_for_fixture(f: Dict[str,Any], th: Dict[Tuple[str,str],float]) -> Op
         "pick": f"• {best['market']} → {best['pick']}: {best['odd']:.2f}"
     }
 
-# ============ BUILD INPUT ============
+# ============ INPUT BUILDER ============
 def build_input_full(fixtures: List[Dict[str, Any]]) -> Dict[str, Any]:
     debug("Building full input")
     out = []
