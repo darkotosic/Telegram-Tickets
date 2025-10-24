@@ -2,299 +2,276 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, sys, time, argparse, math
-from typing import Any, Dict, List, Optional, Tuple
+import os, sys, math, time, random, argparse
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import httpx
 
-# ===== API-Football =====
-API_KEY = os.getenv("API_FOOTBALL_KEY")
+# ================= ENV =================
+API_KEY = os.getenv("API_FOOTBALL_KEY") or os.getenv("API_KEY")
+BASE_URL = os.getenv("API_FOOTBALL_URL", "https://v3.football.api-sports.io")
 if not API_KEY:
     print("⛔ Missing API_FOOTBALL_KEY", file=sys.stderr)
     sys.exit(1)
 
-BASE_URL = os.getenv("API_FOOTBALL_URL", "https://v3.football.api-sports.io")
-HEADERS = {"x-apisports-key": API_KEY}
-
-# ===== Telegram (direktno u kodu po zahtevu) =====
+# ===== Telegram slanje =====
 TELEGRAM_BOT_TOKEN = "7350949079:AAFyq-BZQeSGoJl0wzWA6a0796yqN0f3v4E"
 TELEGRAM_CHANNELS = ["@betsmart_win_more", "@naksir_server_channel", "@naksiranalysis"]
 
-# ===== Podešavanja =====
+# ================= Podešavanja =================
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Belgrade"))
-# ciljevi za kombinovanje
-ODDS_SINGLE_MAX = float(os.getenv("ODDS_SINGLE_MAX", "1.55"))   # gornja granica kvote po paru
-MIN_SINGLE_ODD  = float(os.getenv("MIN_SINGLE_ODD",  "1.18"))   # donja granica kvote po paru
-TICKET_TARGET   = float(os.getenv("TICKET_TARGET",   "2.50"))   # minimalna ukupna kvota tiketa
-LEGS_MIN        = int(os.getenv("LEGS_MIN",          "2"))
-LEGS_MAX        = int(os.getenv("LEGS_MAX",          "3"))
-TICKETS_COUNT   = int(os.getenv("TICKETS_COUNT",     "4"))      # tačno 4 tiketa
-
-RATE_LIMIT_RPS  = float(os.getenv("RATE_LIMIT_RPS",  "3"))      # zaštita od 429
-RETRY_MAX       = int(os.getenv("RETRY_MAX",         "4"))
-
-# ignorisati završene/stopirane
+TARGETS = [2.0, 3.0, 4.0, 5.0]
+MIN_SINGLE_ODD = float(os.getenv("MIN_SINGLE_ODD", "1.01"))
+HOME_ODD_MAX = float(os.getenv("HOME_ODD_MAX", "1.45"))
+RETRY_MAX = int(os.getenv("RETRY_MAX", "4"))
+RATE_LIMIT_RPS = float(os.getenv("RATE_LIMIT_RPS", "3"))
+ALLOW_LEAGUES: Set[int] = set()
 SKIP = {"FT","AET","PEN","CANC","ABD","WO","PST","SUSP","1H","2H","HT","LIVE","ET","BT"}
+HEADERS = {"x-apisports-key": API_KEY}
 
-# ALLOW_LIST opciono kroz env; prazno = sve
-_allow_env = (os.getenv("ALLOW_LIST") or "").strip()
-ALLOW_LIST: Optional[set[int]] = {int(x) for x in _allow_env.split(",") if x.strip().isdigit()} if _allow_env else None
+# ================= HTTP helper =================
+def _client() -> httpx.Client:
+    print("DEBUG: initializing httpx client")
+    return httpx.Client(timeout=30)
 
-# ===== HTTP helperi =====
-def _sleep_for_rate(): 
+def _sleep_for_rate():
     if RATE_LIMIT_RPS > 0:
+        print(f"DEBUG: sleeping for rate limit {1.0/RATE_LIMIT_RPS:.2f}s")
         time.sleep(1.0 / RATE_LIMIT_RPS)
 
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{BASE_URL.rstrip('/')}{path if path.startswith('/') else '/' + path}"
+    url = f"{BASE_URL}{'' if path.startswith('/') else '/'}{path}"
+    print(f"DEBUG: GET {url} {params}")
     last_exc = None
     for i in range(RETRY_MAX):
         try:
             _sleep_for_rate()
-            with httpx.Client(timeout=30) as c:
-                r = c.get(url, headers=HEADERS, params=params or {})
+            with _client() as c:
+                r = c.get(url, headers=HEADERS, params=params)
+                print(f"DEBUG: HTTP status {r.status_code}")
                 if r.status_code == 429:
+                    print(f"DEBUG: rate limited, retry {i}")
                     time.sleep(min(2 ** i, 30))
                     continue
                 r.raise_for_status()
                 return r.json()
         except httpx.HTTPError as e:
+            print(f"DEBUG: HTTP error {e}, retry {i}")
             last_exc = e
             time.sleep(min(2 ** i, 15))
     raise last_exc or RuntimeError("GET failed")
 
-# ===== API-Football fetch =====
+# ================= API-Football =================
 def fetch_fixtures(date_str: str) -> List[Dict[str, Any]]:
-    return _get("/fixtures", {"date": date_str}).get("response") or []
+    print(f"DEBUG: fetching fixtures for {date_str}")
+    data = _get("/fixtures", {"date": date_str})
+    response = data.get("response") or []
+    print(f"DEBUG: fixtures count: {len(response)}")
+    return response
 
 def fetch_odds(fid: int) -> List[Dict[str, Any]]:
-    return _get("/odds", {"fixture": fid}).get("response") or []
+    print(f"DEBUG: fetching odds for fixture {fid}")
+    data = _get("/odds", {"fixture": fid})
+    response = data.get("response") or []
+    print(f"DEBUG: odds sets: {len(response)}")
+    return response
 
-# ===== Parsiranje tržišta i filtriranje =====
-# EXPLICITNO izbacujemo BTTS
-BLOCKED_MARKETS = {"both teams to score", "btts"}
-
-# dozvoljena tržišta i mapiranje vrednosti na čitljiv format
-VALUE_NORMALIZER = {
-    "1": ("Match Winner", "Home Win"),
-    "2": ("Match Winner", "Away Win"),
-    "home": ("Match Winner", "Home Win"),
-    "away": ("Match Winner", "Away Win"),
-    "home/away": ("Double Chance", "12"),
-    "draw": ("1X2", "Draw"),
-    "1x": ("Double Chance", "1X"),
-    "x2": ("Double Chance", "X2"),
-    "over 0.5": ("Over/Under", "Over 0.5"),
-    "over 1.5": ("Over/Under", "Over 1.5"),
-    "over 2.5": ("Over/Under", "Over 2.5"),
-    "under 3.5": ("Over/Under", "Under 3.5"),
-    "under 2.5": ("Over/Under", "Under 2.5"),
-}
-
-def _pick_from_betname(betname: str, values: List[Dict[str, Any]]) -> List[Tuple[str,str,float]]:
-    nm = betname.lower().strip()
-    if any(k in nm for k in BLOCKED_MARKETS):
-        return []  # BTTS out
-
-    picks: List[Tuple[str,str,float]] = []
-    for v in values or []:
-        val_raw = str(v.get("value") or "").strip()
-        odd_raw = v.get("odd")
-        try:
-            odd = float(odd_raw)
-        except Exception:
-            continue
-        if not (MIN_SINGLE_ODD <= odd <= ODDS_SINGLE_MAX):
-            continue
-
-        key = val_raw.lower()
-        if key in VALUE_NORMALIZER:
-            market, value = VALUE_NORMALIZER[key]
-        else:
-            # za 1X2 / Double Chance / Over/Under gde value već ima naziv
-            if any(s in nm for s in ("1x2", "match winner", "match odds")):
-                market, value = ("Match Winner/1X2", val_raw)
-            elif "double chance" in nm:
-                market, value = ("Double Chance", val_raw)
-            elif "over/under" in nm or "goals over/under" in nm or "total goals" in nm:
-                market, value = ("Over/Under", val_raw)
-            else:
-                # ostala tržišta dopuštamo ali pod uslovom da nisu BTTS
-                market, value = (betname, val_raw)
-
-        picks.append((market, value, odd))
-    return picks
-
-def collect_candidates(fixture: Dict[str, Any], odds_resp: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for item in odds_resp or []:
+def _min_odd_in_bet(odds_resp: List[Dict[str, Any]], bet_name: str) -> Dict[str, float]:
+    print(f"DEBUG: parsing odds for bet '{bet_name}'")
+    out: Dict[str, float] = {}
+    for item in odds_resp:
         for bm in item.get("bookmakers", []) or []:
             for bet in bm.get("bets", []) or []:
-                betname = bet.get("name") or ""
-                for market, value, odd in _pick_from_betname(betname, bet.get("values") or []):
-                    out.append({
-                        "fixture": fixture.get("fixture") or fixture,
-                        "league": fixture.get("league") or {},
-                        "teams": fixture.get("teams") or {},
-                        "market": market,
-                        "value": value,
-                        "odd": odd,
-                    })
+                if bet.get("name") != bet_name:
+                    continue
+                for v in bet.get("values", []) or []:
+                    label = (v.get("value") or "").strip()
+                    try:
+                        odd = float(v.get("odd") or 0)
+                    except Exception:
+                        odd = 0.0
+                    if odd <= 0:
+                        continue
+                    if label not in out or odd < out[label]:
+                        out[label] = odd
+    print(f"DEBUG: parsed {len(out)} values for '{bet_name}': {out}")
     return out
 
-# ===== Kompozicija tiketa =====
-def build_pool(date_str: str) -> List[Dict[str, Any]]:
+# ================= Selekcija parova =================
+def build_picks(date_str: str) -> List[Dict[str, Any]]:
+    print(f"DEBUG: building picks for {date_str}")
     fixtures = fetch_fixtures(date_str)
-    res: List[Dict[str, Any]] = []
+    picks: List[Dict[str, Any]] = []
 
-    # Ako je aktivan allow-list, filtriraj
-    allow_active = bool(ALLOW_LIST)
     for f in fixtures:
-        fx = f.get("fixture", {}) or {}
+        fxt = f.get("fixture", {}) or {}
         lg = f.get("league", {}) or {}
-        if not fx.get("id"):
+        tm = f.get("teams", {}) or {}
+        fid = fxt.get("id")
+
+        if not fid:
             continue
-        st = (fx.get("status") or {}).get("short") or ""
-        if st in SKIP:
+        st_short = ((fxt.get("status") or {}).get("short")) or ""
+        if st_short in SKIP:
             continue
-        if allow_active and lg.get("id") not in ALLOW_LIST:
+        if ALLOW_LEAGUES and lg.get("id") not in ALLOW_LEAGUES:
             continue
 
-        odds = fetch_odds(fx["id"])
-        res.extend(collect_candidates(f, odds))
+        odds_resp = fetch_odds(fid)
+        if not odds_resp:
+            continue
 
-    # sort po kvoti opadajuće
-    res.sort(key=lambda d: float(d["odd"]), reverse=True)
-    return res
+        # 1X double chance
+        dc = _min_odd_in_bet(odds_resp, "Double Chance")
+        odd_1x = dc.get("1X") or dc.get("Home/Draw")
+        odd_x2 = dc.get("X2") or dc.get("Draw/Away")
+        if odd_1x and odd_x2 and odd_1x < odd_x2 and odd_1x >= MIN_SINGLE_ODD:
+            picks.append({
+                "fixture": fxt, "league": lg, "teams": tm,
+                "market": "Double Chance", "value": "1X", "odd": float(odd_1x)
+            })
+            print(f"DEBUG: added DC 1X {odd_1x} for fixture {fid}")
 
-def _format_leg(d: Dict[str, Any]) -> str:
-    lg = d.get("league", {})
-    tm = d.get("teams", {})
-    fx = d.get("fixture", {})
-    dt_iso = fx.get("date")
+        # HOME win
+        m1x2 = _min_odd_in_bet(odds_resp, "Match Winner") or _min_odd_in_bet(odds_resp, "1X2")
+        home = m1x2.get("Home") or m1x2.get("1")
+        away = m1x2.get("Away") or m1x2.get("2")
+        if home and away and home < away and home < HOME_ODD_MAX and home >= MIN_SINGLE_ODD:
+            picks.append({
+                "fixture": fxt, "league": lg, "teams": tm,
+                "market": "1X2", "value": "Home", "odd": float(home)
+            })
+            print(f"DEBUG: added Home win {home} for fixture {fid}")
+
+    random.shuffle(picks)
+    print(f"DEBUG: total picks collected: {len(picks)}")
+    return picks
+
+# ================= Format =================
+def _fmt_leg(d: Dict[str, Any]) -> str:
+    lg = d.get("league", {}); tm = d.get("teams", {}); fxt = d.get("fixture", {})
+    dt_iso = fxt.get("date")
     try:
-        tstr = datetime.fromisoformat(str(dt_iso).replace("Z","+00:00")).astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+        dt = datetime.fromisoformat(str(dt_iso).replace("Z", "+00:00")).astimezone(TZ)
+        tstr = dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         tstr = str(dt_iso)
     league_name = f"{lg.get('country','')} — {lg.get('name','')}".strip(" —")
     home = (tm.get("home") or {}).get("name", "Home")
     away = (tm.get("away") or {}).get("name", "Away")
-    return (
+    text = (
         f"🏟 {league_name}\n"
-        f"🆔 Fixture ID: {fx.get('id')}\n"
+        f"🆔 Fixture ID: {fxt.get('id')}\n"
         f"⚽ {home} vs {away}\n"
         f"⏰ {tstr}\n"
         f"• {d['market']} → {d['value']}: {float(d['odd']):.2f}"
     )
+    print(f"DEBUG: formatted leg {fxt.get('id')} {d['market']} {d['odd']}")
+    return text
 
-def make_tickets(pool: List[Dict[str, Any]]) -> List[str]:
-    tickets: List[str] = []
-    used_fixtures: set[int] = set()
+# ================= Ticket builder =================
+def make_tickets_for_targets(picks: List[Dict[str, Any]], targets: List[float]) -> List[str]:
+    print(f"DEBUG: making tickets for targets {targets}")
+    tickets_text: List[str] = []
+    used_global: Set[int] = set()
+    picks_sorted = sorted(picks, key=lambda x: float(x["odd"]), reverse=True)
 
-    def can_use(d: Dict[str, Any]) -> bool:
-        fx = d.get("fixture", {})
-        fid = fx.get("id")
-        return fid not in used_fixtures
+    def fid_of(p: Dict[str, Any]) -> Optional[int]:
+        return (p.get("fixture") or {}).get("id")
 
-    i = 0
-    while len(tickets) < TICKETS_COUNT and i < len(pool):
-        block: List[Dict[str, Any]] = []
-        total = 1.0
-        # greedy: biraj najbolje kvote koje nisu već korišćene i dosegni target
-        for j in range(i, len(pool)):
-            d = pool[j]
-            if not can_use(d):
+    for target in targets:
+        print(f"DEBUG: building ticket target {target}")
+        cur: List[Dict[str, Any]] = []
+        cur_total = 1.0
+        used_local: Set[int] = set()
+
+        for p in picks_sorted:
+            fid = fid_of(p)
+            if not fid or fid in used_global or fid in used_local:
                 continue
-            cand = block + [d]
-            if len(cand) > LEGS_MAX:
+            o = float(p.get("odd") or 1.0)
+            if o < MIN_SINGLE_ODD:
                 continue
-            new_total = total * float(d["odd"])
-            block.append(d)
-            total = new_total
-            if len(block) >= LEGS_MIN and total >= TICKET_TARGET:
+            cur.append(p)
+            used_local.add(fid)
+            cur_total *= o
+            if cur_total >= target:
                 break
-        # ako nije dostigao target, pokušaj da dodaš još jednu iz repa
-        if not (len(block) >= LEGS_MIN and total >= TICKET_TARGET):
-            # pokušaj još jednom sken kroz ostatak
-            for k in range(len(pool)-1, -1, -1):
-                if len(block) >= LEGS_MAX:
-                    break
-                d2 = pool[k]
-                if can_use(d2):
-                    block.append(d2)
-                    total *= float(d2["odd"])
-                    if len(block) >= LEGS_MIN and total >= TICKET_TARGET:
-                        break
 
-        if len(block) >= LEGS_MIN:
-            for d in block:
-                fid = (d.get("fixture") or {}).get("id")
-                if fid: used_fixtures.add(fid)
-            parts = [_format_leg(x) for x in block]
-            comps = [f"{float(x['odd']):.2f}" for x in block]
-            ticket_txt = "\n\n".join(parts) + f"\n\nTOTAL ODDS: {' × '.join(comps)} = {total:.2f}"
-            tickets.append(ticket_txt)
+        if cur:
+            used_global |= used_local
+            body = "\n\n".join(_fmt_leg(x) for x in cur)
+            total = 1.0; parts = []
+            for x in cur:
+                ox = float(x["odd"]); total *= ox; parts.append(f"{ox:.2f}")
+            body += f"\n\nTOTAL ODDS: {' × '.join(parts)} = {total:.2f}"
+            tickets_text.append(body)
+            print(f"DEBUG: ticket target {target} built with total odds {total:.2f}")
+        else:
+            print(f"DEBUG: not enough picks to reach target {target}")
 
-        i += 1
-
-    # ako i dalje nema 4, dopuni sa najboljim preostalim parovima pojedinačno
-    if len(tickets) < TICKETS_COUNT:
-        for d in pool:
-            if len(tickets) >= TICKETS_COUNT:
+    if len(tickets_text) < 4:
+        print("DEBUG: filling missing tickets with singles")
+        for p in picks_sorted:
+            if len(tickets_text) >= 4:
                 break
-            if not can_use(d):
+            fid = fid_of(p)
+            if not fid or fid in used_global:
                 continue
-            block = [d]
-            total = float(d["odd"])
-            parts = [_format_leg(d)]
-            comps = [f"{total:.2f}"]
-            ticket_txt = "\n\n".join(parts) + f"\n\nTOTAL ODDS: {' × '.join(comps)} = {total:.2f}"
-            tickets.append(ticket_txt)
-            fid = (d.get("fixture") or {}).get("id")
-            if fid: used_fixtures.add(fid)
+            body = _fmt_leg(p)
+            o = float(p["odd"])
+            body += f"\n\nTOTAL ODDS: {o:.2f}"
+            tickets_text.append(body)
+            used_global.add(fid)
+            print(f"DEBUG: added single filler ticket for fixture {fid}")
 
-    return tickets[:TICKETS_COUNT]
+    print(f"DEBUG: total tickets built {len(tickets_text)}")
+    return tickets_text[:4]
 
-# ===== Telegram slanje =====
-def _tg_send(text: str) -> None:
+# ================= Telegram slanje =================
+def tg_send(text: str) -> None:
+    print(f"DEBUG: sending Telegram message len={len(text)}")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for ch in TELEGRAM_CHANNELS:
-        try:
-            with httpx.Client(timeout=20) as c:
-                c.post(url, json={"chat_id": ch, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
-        except Exception:
-            pass
+    payload = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    with httpx.Client(timeout=20) as c:
+        for ch in TELEGRAM_CHANNELS:
+            try:
+                r = c.post(url, json={**payload, "chat_id": ch})
+                print(f"DEBUG: sent to {ch}, status {r.status_code}")
+            except Exception as e:
+                print(f"DEBUG: failed to send to {ch}: {e}")
 
-def run(date_str: Optional[str] = None, send_telegram: bool = True) -> List[str]:
-    date_str = date_str or datetime.now(TZ).strftime("%Y-%m-%d")
-    pool = build_pool(date_str)
-    tickets = make_tickets(pool)
+# ================= Main run =================
+def run(date_str: str, send_telegram: bool = True) -> List[str]:
+    print(f"DEBUG: run started for {date_str}")
+    picks = build_picks(date_str)
+    tickets = make_tickets_for_targets(picks, TARGETS)
 
-    # header za dnevni paket
-    header = f"📅 {date_str} — NAKSIR ANALYST AI\nIzbačeni BTTS marketi. Formirano {len(tickets)} tiketa."
+    header = f"📅 {date_str} — NAKSIR ANALYST AI\nBTTS markets excluded. Formirano {len(tickets)} tiketa."
+    print(f"DEBUG: header ready")
     if send_telegram:
-        _tg_send(header)
-        for idx, t in enumerate(tickets, 1):
-            _tg_send(f"🎫 Ticket #{idx}\n{t}")
+        tg_send(header)
+        for i, t in enumerate(tickets, 1):
+            tg_send(f"🎫 Ticket #{i}\n{t}")
+            print(f"DEBUG: sent Ticket #{i}")
 
-    # ispis u log
     print(header)
     for i, t in enumerate(tickets, 1):
         print(f"\n--- Ticket #{i} ---\n{t}\n")
 
+    print("DEBUG: run complete")
     return tickets
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--date", help="YYYY-MM-DD; default today", default=None)
-    ap.add_argument("--no-send", action="store_true", help="ne šalji na Telegram, samo ispis")
-    args = ap.parse_args()
-    run(args.date, send_telegram=not args.no_send)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="YYYY-MM-DD; default today in Europe/Belgrade")
+    parser.add_argument("--no-send", action="store_true", help="ne šalji na Telegram")
+    args = parser.parse_args()
+    date_str = args.date or datetime.now(TZ).strftime("%Y-%m-%d")
+    print(f"DEBUG: main entry date={date_str}, send={not args.no_send}")
+    run(date_str, send_telegram=not args.no_send)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    main()
