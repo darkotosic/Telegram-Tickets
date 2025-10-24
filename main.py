@@ -10,11 +10,7 @@ def _run(cmd: list[str]) -> int:
     return subprocess.call(cmd, cwd=str(ROOT))
 
 def morning() -> int:
-    rc = _run([sys.executable, str(ROOT / "all_tips_ticket.py")])
-    if rc != 0:
-        print("Generator failed.", file=sys.stderr)
-        return rc
-    return _run([sys.executable, str(ROOT / "all_tips_ticket_airtable_uploader.py")])
+    return _run([sys.executable, str(ROOT / "telegram_all_tips_ticket.py")])
 
 def main() -> None:
     ap = argparse.ArgumentParser()
