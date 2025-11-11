@@ -1,4 +1,4 @@
-# telegram_all_tips_ticket.py (dynamic allow + debug)
+# telegram_all_tips_ticket.py (dynamic allow + odds-by-date fallback + debug)
 from __future__ import annotations
 import os, json, time, math, random
 from typing import Any, Dict, List, Tuple, Optional
@@ -89,7 +89,7 @@ PREFERRED_LEAGUES: set[Tuple[str,str]] = {
     ("World", "UEFA Nations League"),
 }
 
-# 2) Tvoj stari statički set kao backup (ako API promeni nazive ili search ne vrati sve)
+# 2) Statički backup skup (ako API promeni nazive ili search ne vrati sve)
 ALLOW_LIST_STATIC: set[int] = {
     2,3,913,5,536,808,960,10,667,29,30,31,32,37,33,34,848,311,310,342,218,144,315,71,
     169,210,346,233,39,40,41,42,703,244,245,61,62,78,79,197,271,164,323,135,136,389,
@@ -101,7 +101,7 @@ def _leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": name}
     data = _get("/leagues", params)
     out = []
-    for it in data.get("response", []):
+    for it in data.get("response", []) or []:
         lg = it.get("league") or {}
         cc = (it.get("country") or {}).get("name")
         seasons = it.get("seasons") or []
@@ -142,7 +142,7 @@ RELAXED_BANDS: Dict[Tuple[str,str], Tuple[float,float]] = {
     k: (max(1.10, lo - 0.05), hi + 0.25) for k,(lo,hi) in MARKET_BANDS.items()
 }
 
-# Ticket #2: tri tržišta sa cap-ovima (≤ cap) za target ≥ 1.85
+# Ticket #2: cap-ovi (≤ cap) za target ≥ 1.85
 ALLOW_ALL_CAPS: Dict[Tuple[str,str], float] = {
     ("1st Half Goals","Over 0.5"): 1.35,
     ("Home Team Goals","Over 0.5"): 1.20,
@@ -153,6 +153,52 @@ RELAXED_CAPS: Dict[Tuple[str,str], float] = {
     ("Home Team Goals","Over 0.5"): 1.25,
     ("Away Team Goals","Over 0.5"): 1.30,
 }
+
+# ================= ODDS BY DATE FALLBACK =================
+# Globalni keš za /odds?date=YYYY-MM-DD
+_ODDS_BY_DATE_CACHE: dict[str, dict[int, dict[str, dict[str, float]]]] = {}
+
+def _collect_odds_from_items(items: list) -> dict[int, dict[str, dict[str, float]]]:
+    """
+    Mapira: fixture_id -> market_name -> outcome_name -> max_odd
+    """
+    out: dict[int, dict[str, dict[str, float]]] = {}
+    for item in items or []:
+        fixture = (item.get("fixture") or {}).get("id")
+        if not fixture:
+            continue
+        f = int(fixture)
+        dst = out.setdefault(f, {})
+        for bm in item.get("bookmakers", []) or []:
+            for m in bm.get("markets", []) or []:
+                mkt = m.get("name")
+                if not mkt:
+                    continue
+                slot = dst.setdefault(mkt, {})
+                for oc in m.get("outcomes", []) or []:
+                    name = oc.get("name")
+                    odd  = oc.get("price") or oc.get("odd")
+                    try:
+                        v = float(odd)
+                    except Exception:
+                        continue
+                    prev = slot.get(name)
+                    if prev is None or v > prev:
+                        slot[name] = v
+    return out
+
+def _odds_by_date(date_str: str) -> dict[int, dict[str, dict[str, float]]]:
+    """
+    Učitaj sve kvote za jedan dan. Keširano po datumu.
+    """
+    if date_str in _ODDS_BY_DATE_CACHE:
+        return _ODDS_BY_DATE_CACHE[date_str]
+    data = _get("/odds", {"date": date_str})
+    items = data.get("response", []) or []
+    dbg(f"Odds-by-date: items={len(items)}")
+    table = _collect_odds_from_items(items)
+    _ODDS_BY_DATE_CACHE[date_str] = table
+    return table
 
 # ================= FETCH LAYERS =================
 def fixtures_by_date(date_str: str) -> List[Dict[str, Any]]:
@@ -172,30 +218,28 @@ def fixtures_by_date(date_str: str) -> List[Dict[str, Any]]:
     dbg(f"Fixtures: total={len(resp)} usable={len(out)} skipped={cnt_skipped}")
     return out
 
-def odds_by_fixture(fid: int) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
+def odds_by_fixture(fid: int, date_hint: Optional[str] = None) -> Dict[str, Dict[str, float]]:
+    """
+    1) Pokuša /odds?fixture=FID
+    2) Ako prazno i date_hint zadat: koristi /odds?date=DATE pa izdvoji fid
+    """
     data = _get("/odds", {"fixture": fid})
-    items = data.get("response", [])
-    markets_seen = 0
-    for item in items:
-        for bm in item.get("bookmakers", []):
-            for m in bm.get("markets", []):
-                mkt = m.get("name")
-                if not mkt:
-                    continue
-                markets_seen += 1
-                for oc in m.get("outcomes", []):
-                    oname = oc.get("name")
-                    odd = oc.get("price") or oc.get("odd")
-                    try:
-                        v = float(odd)
-                    except Exception:
-                        continue
-                    prev = out.setdefault(mkt, {}).get(oname)
-                    if prev is None or v > prev:
-                        out[mkt][oname] = v
-    dbg(f"Odds fid={fid}: markets_seen={markets_seen} distinct={len(out)}")
-    return out
+    items = data.get("response", []) or []
+    if items:
+        table = _collect_odds_from_items(items)
+        m = table.get(fid) or {}
+        dbg(f"Odds fid={fid}: via fixture, markets={len(m)}")
+        return m
+
+    dbg(f"Odds fid={fid}: empty via fixture; trying date fallback")
+    if date_hint:
+        all_by_date = _odds_by_date(date_hint)
+        m = all_by_date.get(fid) or {}
+        dbg(f"Odds fid={fid}: via date={date_hint}, markets={len(m)}")
+        return m
+
+    dbg(f"Odds fid={fid}: no markets and no date_hint")
+    return {}
 
 # ================= PICK LOGIC =================
 def _pick_in_band(odds_map: Dict[str, Dict[str, float]], spec: Tuple[str,str], lo: float, hi: float):
@@ -284,7 +328,7 @@ def assemble_ticket1_legs(date_str: str) -> List[Dict[str,Any]]:
         fid = int((f.get("fixture") or {}).get("id",0)) or 0
         if not fid:
             continue
-        o = odds_by_fixture(fid)
+        o = odds_by_fixture(fid, date_hint=date_str)
         p = _best_from_bands(o, MARKET_BANDS)
         if p:
             legs.append(_ticket_line(f, p))
@@ -297,7 +341,7 @@ def assemble_ticket1_legs(date_str: str) -> List[Dict[str,Any]]:
             fid = int((f.get("fixture") or {}).get("id",0)) or 0
             if not fid:
                 continue
-            o = odds_by_fixture(fid)
+            o = odds_by_fixture(fid, date_hint=date_str)
             p = _best_from_bands(o, RELAXED_BANDS)
             if p:
                 legs.append(_ticket_line(f, p))
@@ -315,7 +359,7 @@ def assemble_ticket2_legs(date_str: str) -> List[Dict[str,Any]]:
         fid = int((f.get("fixture") or {}).get("id",0)) or 0
         if not fid:
             continue
-        o = odds_by_fixture(fid)
+        o = odds_by_fixture(fid, date_hint=date_str)
         p = _best_from_caps(o, ALLOW_ALL_CAPS)
         if p:
             legs.append(_ticket_line(f, p))
@@ -328,7 +372,7 @@ def assemble_ticket2_legs(date_str: str) -> List[Dict[str,Any]]:
             fid = int((f.get("fixture") or {}).get("id",0)) or 0
             if not fid:
                 continue
-            o = odds_by_fixture(fid)
+            o = odds_by_fixture(fid, date_hint=date_str)
             p = _best_from_caps(o, RELAXED_CAPS)
             if p:
                 legs.append(_ticket_line(f, p))
@@ -401,11 +445,17 @@ def _reasoning_openai(ticket_title: str, legs: List[Dict[str,Any]]) -> str:
 # ================= PUBLIC API =================
 def build_tickets_and_reasoning(date_str: str) -> Tuple[List[str], List[str]]:
     dbg(f"=== build_tickets_and_reasoning date={date_str} ===")
+    # sanity check: pokušaj da vidiš ima li dnevnih kvota
+    try:
+        _ = _odds_by_date(date_str)
+    except Exception as e:
+        dbg(f"ODDS endpoint error: {e}")
+
     used: set[int] = set()
     tickets_texts: List[str] = []
     reasonings: List[str] = []
 
-    # Ticket #1 → 2.00
+    # Ticket #1 → target 2.00
     legs1 = assemble_ticket1_legs(date_str)
     t1, tot1 = _build_ticket(1, 2.00, legs1, used)
     if t1:
@@ -414,7 +464,7 @@ def build_tickets_and_reasoning(date_str: str) -> Tuple[List[str], List[str]]:
     else:
         dbg("Ticket #1 not generated")
 
-    # Ticket #2 → 1.85
+    # Ticket #2 → target 1.85
     legs2 = assemble_ticket2_legs(date_str)
     legs2 = [L for L in legs2 if L["fid"] not in used]
     t2, tot2 = _build_ticket(2, 1.85, legs2, used)
