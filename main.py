@@ -28,7 +28,7 @@ def main() -> None:
         debug(f"TELEGRAM_BOT_TOKEN present: {bool(tele)}")
         debug(f"Channels: {chans}")
 
-        tickets, reasonings = build_tickets_and_reasoning(date_str=date_str)
+        tickets, reasonings = build_tickets_and_reasoning(date_str=date_str, debug=True)
         debug(f"Tickets built: {len(tickets)}")
 
         results = []
