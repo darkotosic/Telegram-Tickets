@@ -1,42 +1,47 @@
-# telegram_all_tips_ticket.py (dynamic allow + odds-by-date fallback + debug)
+# telegram_all_tips_ticket.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, json, time, math, random
-from typing import Any, Dict, List, Tuple, Optional
-from datetime import datetime
 
+import os, sys, json, time, math, random, re
+from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime, timezone
 import httpx
 
-# ================= ENV / CONFIG =================
-API_BASE   = "https://v3.football.api-sports.io"
+# ========================= ENV / CONFIG =========================
+API_BASE   = os.getenv("API_FOOTBALL_URL", "https://v3.football.api-sports.io")
 API_KEY    = os.getenv("API_FOOTBALL_KEY", "").strip() or os.getenv("X_APISPORTS_KEY", "").strip()
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-TELE_BOT   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
 TIMEZONE   = os.getenv("TIMEZONE", "Europe/Belgrade")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL","gpt-4.1-mini").strip()
+
+TELE_BOT   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELE_CHANS = [c.strip() for c in os.getenv("TELEGRAM_CHANNELS","").split(",") if c.strip()]
+
 LEGS_MIN   = int(os.getenv("LEGS_MIN", "2"))
 LEGS_MAX   = int(os.getenv("LEGS_MAX", "6"))
 MAX_MATCHES= int(os.getenv("MAX_MATCHES", "180"))
 QPS_DELAY  = float(os.getenv("QPS_DELAY", "0.35"))
 DEBUG_ON   = os.getenv("DEBUG", "1") not in ("0","false","False","no","No")
+QUIET      = os.getenv("QUIET","0") in ("1","true","True")
 
-SKIP_STATUS= {"FT","AET","PEN","PST","CANC","ABD","AWD","WO","SUSP","INT"}  # ne preskačemo NS i LIVE
+# Ne preskačemo NS i LIVE, želimo i rano i kasnije ponuđene kvote
+SKIP_STATUS= {"FT","AET","PEN","PST","CANC","ABD","AWD","WO","SUSP","INT"}
 
-# ================= DEBUG =================
 def dbg(msg: str):
-    if DEBUG_ON:
+    if DEBUG_ON and not QUIET:
         now = datetime.now().strftime("%H:%M:%S")
         print(f"[DBG] {now} | {msg}", flush=True)
 
 def _sleep():
     time.sleep(QPS_DELAY + random.uniform(0.0, 0.08))
 
-# ================= HTTP CORE =================
+# ========================= HTTP CORE =========================
 _http_cache: Dict[str, Any] = {}
 
 def _client() -> httpx.Client:
     if not API_KEY:
         raise RuntimeError("Missing API_FOOTBALL_KEY or X_APISPORTS_KEY")
-    return httpx.Client(base_url=API_BASE, headers={"x-apisports-key": API_KEY}, timeout=35)
+    return httpx.Client(base_url=API_BASE, headers={"x-apisports-key": API_KEY}, timeout=40)
 
 def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     key = f"GET::{path}::{json.dumps(params, sort_keys=True)}"
@@ -55,14 +60,15 @@ def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         return data
 
 def _fmt_dt_local(iso_str: str) -> str:
+    # APIFOOTBALL vraća ISO sa Z; prikaz lokalizovan format
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z","+00:00"))
+        # samo string bez realne tz konverzije, da ne uvodimo zoneinfo zavisnost u GH runneru
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return iso_str
 
-# ================= PREFERENCES =================
-# 1) “Po imenu i državi” -> dinamički resolve u league.id
+# ========================= LIGE: prefer + fallback =========================
 PREFERRED_LEAGUES: set[Tuple[str,str]] = {
     ("England", "Premier League"),
     ("England", "Championship"),
@@ -89,15 +95,14 @@ PREFERRED_LEAGUES: set[Tuple[str,str]] = {
     ("World", "UEFA Nations League"),
 }
 
-# 2) Statički backup skup (ako API promeni nazive ili search ne vrati sve)
+# Staticki backup (kad search ne vrati sve ili API promeni naziv)
 ALLOW_LIST_STATIC: set[int] = {
     2,3,913,5,536,808,960,10,667,29,30,31,32,37,33,34,848,311,310,342,218,144,315,71,
     169,210,346,233,39,40,41,42,703,244,245,61,62,78,79,197,271,164,323,135,136,389,
     88,89,408,103,104,106,94,283,235,286,287,322,140,141,113,207,208,202,203,909,268,269,270,340
 }
 
-def _leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
-    # /leagues?search=Name -> filtriramo po country i current sezoni
+def _leagues_search(name: str, want_country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": name}
     data = _get("/leagues", params)
     out = []
@@ -105,19 +110,20 @@ def _leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
         lg = it.get("league") or {}
         cc = (it.get("country") or {}).get("name")
         seasons = it.get("seasons") or []
-        current = any(s.get("current") for s in seasons)
-        # Ako country == "World" dozvoli sve zemlje za UEFA takmičenja
-        if current and (country is None or cc == country or country == "World"):
+        current = any(bool(s.get("current")) for s in seasons)
+        if not current:
+            continue
+        if want_country in (None, "World") or cc == want_country:
             out.append({"id": lg.get("id"), "name": lg.get("name"), "country": cc})
     return out
 
 def resolve_allow_ids() -> set[int]:
     ids: set[int] = set()
     for country, name in sorted(PREFERRED_LEAGUES):
-        results = _leagues_search(name, None if country == "World" else country)
-        if not results:
+        res = _leagues_search(name, country)
+        if not res:
             dbg(f"RESOLVE miss: {country} — {name}")
-        for r in results:
+        for r in res:
             if r["id"]:
                 ids.add(int(r["id"]))
     ids |= {int(x) for x in ALLOW_LIST_STATIC}
@@ -126,8 +132,8 @@ def resolve_allow_ids() -> set[int]:
 
 ALLOW_IDS: set[int] = resolve_allow_ids()
 
-# ================= MARKETS SETUP =================
-# Ticket #1: “bandovi” (min,max) za stabilno slaganje ≥ 2.00
+# ========================= MARKETS i pragovi =========================
+# T1: biramo iz "bandova" (interval [lo, hi]) za stabilno slaganje ka ~2.00
 MARKET_BANDS: Dict[Tuple[str,str], Tuple[float,float]] = {
     ("Double Chance","1X"): (1.20, 1.45),
     ("Double Chance","X2"): (1.20, 1.45),
@@ -142,134 +148,257 @@ RELAXED_BANDS: Dict[Tuple[str,str], Tuple[float,float]] = {
     k: (max(1.10, lo - 0.05), hi + 0.25) for k,(lo,hi) in MARKET_BANDS.items()
 }
 
-# Ticket #2: cap-ovi (≤ cap) za target ≥ 1.85
-ALLOW_ALL_CAPS: Dict[Tuple[str,str], float] = {
+# T2: cap-ovi (<= cap) prema zahtevu; target ukupno >= 1.85
+ALLOW_ALL_CAPS_HARD: Dict[Tuple[str,str], float] = {
     ("1st Half Goals","Over 0.5"): 1.35,
     ("Home Team Goals","Over 0.5"): 1.20,
     ("Away Team Goals","Over 0.5"): 1.25,
 }
-RELAXED_CAPS: Dict[Tuple[str,str], float] = {
+ALLOW_ALL_CAPS_RELAX: Dict[Tuple[str,str], float] = {
     ("1st Half Goals","Over 0.5"): 1.40,
     ("Home Team Goals","Over 0.5"): 1.25,
     ("Away Team Goals","Over 0.5"): 1.30,
 }
+MIN_T2_TOTAL = 1.85
 
-# ================= ODDS BY DATE FALLBACK =================
-# Globalni keš za /odds?date=YYYY-MM-DD
-_ODDS_BY_DATE_CACHE: dict[str, dict[int, dict[str, dict[str, float]]]] = {}
+# ========================= Odds parser =========================
+# API može vratiti 2 različita oblika:
+# A) response[].bookmakers[].bets[].values[]  (stariji)
+# B) response[].bookmakers[].markets[].outcomes[]  (noviji)
+# Uzimamo maksimum po market->outcome.
+FORBIDDEN_SUBSTRS = [
+    "asian","alternative","corners","cards","booking","penalties","penalty",
+    "offside","throw in","interval","race to","period","quarter",
+    "draw no bet","dnb","to qualify","method of victory","overtime","extra time",
+    "win to nil","clean sheet","anytime","player","scorer",
+]
 
-def _collect_odds_from_items(items: list) -> dict[int, dict[str, dict[str, float]]]:
+OU_EQUIV = {
+    "Over1.5": "Over 1.5",
+    "Under3.5": "Under 3.5",
+    "Over2.5": "Over 2.5",
+}
+
+DOC_MARKETS = {
+    "match_winner": {"Match Winner","1X2","Full Time Result","Result"},
+    "double_chance": {"Double Chance","Double chance"},
+    "btts": {"Both Teams To Score","Both teams to score","BTTS","Both Teams Score"},
+    "ou": {"Goals Over/Under","Over/Under","Total Goals","Total","Goals Over Under","Total Goals Over/Under"},
+    "ou_1st": {"1st Half - Over/Under","1st Half Goals Over/Under","First Half - Over/Under","Over/Under - 1st Half","First Half Goals","Goals Over/Under - 1st Half"},
+    "ttg_home": {"Home Team Total Goals","Home Team Goals","Home Team - Total Goals","Home Total Goals"},
+    "ttg_away": {"Away Team Total Goals","Away Team Goals","Away Team - Total Goals","Away Team Goals"},
+    "ttg_generic": {"Team Total Goals","Total Team Goals","Team Goals"},
+}
+
+def _is_fulltime_main(name: str) -> bool:
+    nl=(name or "").lower()
+    return not any(b in nl for b in FORBIDDEN_SUBSTRS)
+
+def _norm_ou_value(v: str) -> str:
+    s=(v or "").strip().title()
+    for k,rep in OU_EQUIV.items():
+        s=s.replace(k, rep)
+    s=re.sub(r"\s+"," ", s)
+    return s
+
+def _is_over05(val: str) -> bool:
+    return re.search(r"(?i)\bover\s*0\.5\b", val or "") is not None
+
+def _mentions_home(val: str) -> bool:
+    return re.search(r"(?i)\bhome\b", val or "") is not None
+
+def _mentions_away(val: str) -> bool:
+    return re.search(r"(?i)\baway\b", val or "") is not None
+
+def _try_float(x: Any) -> Optional[float]:
+    try:
+        v=float(x); return v if v>0 else None
+    except Exception:
+        return None
+
+def _collect_odds_table(items: list) -> Dict[int, Dict[str, Dict[str, float]]]:
     """
-    Mapira: fixture_id -> market_name -> outcome_name -> max_odd
+    fixture_id -> market_name -> outcome_name -> max_odd
+    Pokriva bets/values i markets/outcomes.
     """
-    out: dict[int, dict[str, dict[str, float]]] = {}
-    for item in items or []:
-        fixture = (item.get("fixture") or {}).get("id")
-        if not fixture:
+    out: Dict[int, Dict[str, Dict[str,float]]] = {}
+    for it in items or []:
+        fx = (it.get("fixture") or {}).get("id") or (it.get("fixture") or {}).get("fixture")
+        if not fx: 
             continue
-        f = int(fixture)
-        dst = out.setdefault(f, {})
-        for bm in item.get("bookmakers", []) or []:
-            for m in bm.get("markets", []) or []:
-                mkt = m.get("name")
-                if not mkt:
+        fid = int(fx)
+        slot = out.setdefault(fid, {})
+
+        for bm in it.get("bookmakers",[]) or []:
+            # Noviji
+            for m in bm.get("markets",[]) or []:
+                mkt = (m.get("name") or "").strip()
+                if not mkt: 
                     continue
-                slot = dst.setdefault(mkt, {})
-                for oc in m.get("outcomes", []) or []:
-                    name = oc.get("name")
-                    odd  = oc.get("price") or oc.get("odd")
-                    try:
-                        v = float(odd)
-                    except Exception:
+                dst = slot.setdefault(mkt, {})
+                for oc in m.get("outcomes",[]) or []:
+                    name = (oc.get("name") or "").strip()
+                    odd  = oc.get("price") if oc.get("price") is not None else oc.get("odd")
+                    v = _try_float(odd)
+                    if v is None: 
                         continue
-                    prev = slot.get(name)
-                    if prev is None or v > prev:
-                        slot[name] = v
+                    if name and (name not in dst or v > dst[name]):
+                        dst[name] = v
+
+            # Stariji
+            for bet in bm.get("bets",[]) or []:
+                raw = (bet.get("name") or "").strip()
+                if not raw:
+                    continue
+
+                # 1st half OU 0.5
+                if raw in DOC_MARKETS["ou_1st"]:
+                    dst = slot.setdefault("1st Half Goals", {})
+                    for val in bet.get("values",[]) or []:
+                        if _is_over05(val.get("value") or ""):
+                            v=_try_float(val.get("odd"))
+                            if v is not None:
+                                prev=dst.get("Over 0.5")
+                                if prev is None or v>prev:
+                                    dst["Over 0.5"]=v
+                    continue
+
+                if not _is_fulltime_main(raw):
+                    continue
+
+                # Match winner
+                if raw in DOC_MARKETS["match_winner"]:
+                    dst = slot.setdefault("Match Winner", {})
+                    for val in bet.get("values",[]) or []:
+                        nm=(val.get("value") or "").strip()
+                        if nm in ("Home","1"):
+                            v=_try_float(val.get("odd")); 
+                            if v is not None: dst["Home"]=max(dst.get("Home",0.0), v)
+                        elif nm in ("Away","2"):
+                            v=_try_float(val.get("odd"));
+                            if v is not None: dst["Away"]=max(dst.get("Away",0.0), v)
+                    continue
+
+                # Double chance
+                if raw in DOC_MARKETS["double_chance"]:
+                    dst = slot.setdefault("Double Chance", {})
+                    for val in bet.get("values",[]) or []:
+                        nm=(val.get("value") or "").replace(" ","").upper()
+                        if nm in {"1X","X2","12"}:
+                            v=_try_float(val.get("odd"))
+                            if v is not None: dst[nm]=max(dst.get(nm,0.0), v)
+                    continue
+
+                # BTTS
+                if raw in DOC_MARKETS["btts"]:
+                    dst = slot.setdefault("Both Teams To Score", {})
+                    for val in bet.get("values",[]) or []:
+                        nm=(val.get("value") or "").strip().title()
+                        if nm in {"Yes","No"}:
+                            v=_try_float(val.get("odd"))
+                            if v is not None: dst[nm]=max(dst.get(nm,0.0), v)
+                    continue
+
+                # O/U FT
+                if raw in DOC_MARKETS["ou"]:
+                    dst = slot.setdefault("Over/Under", {})
+                    for val in bet.get("values",[]) or []:
+                        nm=_norm_ou_value(val.get("value") or "")
+                        if nm in {"Over 1.5","Under 3.5","Over 2.5"}:
+                            v=_try_float(val.get("odd"))
+                            if v is not None: dst[nm]=max(dst.get(nm,0.0), v)
+                    continue
+
+                # Team total goals (home/away)
+                if raw in DOC_MARKETS["ttg_home"]:
+                    dst = slot.setdefault("Home Team Goals", {})
+                    for val in bet.get("values",[]) or []:
+                        if _is_over05(val.get("value") or ""):
+                            v=_try_float(val.get("odd"))
+                            if v is not None: dst["Over 0.5"]=max(dst.get("Over 0.5",0.0), v)
+                    continue
+
+                if raw in DOC_MARKETS["ttg_away"]:
+                    dst = slot.setdefault("Away Team Goals", {})
+                    for val in bet.get("values",[]) or []:
+                        if _is_over05(val.get("value") or ""):
+                            v=_try_float(val.get("odd"))
+                            if v is not None: dst["Over 0.5"]=max(dst.get("Over 0.5",0.0), v)
+                    continue
+
+                if raw in DOC_MARKETS["ttg_generic"]:
+                    # pokušaj da detektuje Home/Away iz value stringa
+                    for val in bet.get("values",[]) or []:
+                        vv=(val.get("value") or "").strip()
+                        if _is_over05(vv):
+                            if _mentions_home(vv):
+                                dst = slot.setdefault("Home Team Goals", {})
+                                v=_try_float(val.get("odd"))
+                                if v is not None: dst["Over 0.5"]=max(dst.get("Over 0.5",0.0), v)
+                            elif _mentions_away(vv):
+                                dst = slot.setdefault("Away Team Goals", {})
+                                v=_try_float(val.get("odd"))
+                                if v is not None: dst["Over 0.5"]=max(dst.get("Over 0.5",0.0), v)
+                    continue
+
     return out
 
+# ========================= ODDS BY DATE FALLBACK =========================
+_ODDS_BY_DATE_CACHE: dict[str, dict[int, dict[str, dict[str, float]]]] = {}
+
 def _odds_by_date(date_str: str) -> dict[int, dict[str, dict[str, float]]]:
-    """
-    Učitaj sve kvote za jedan dan. Keširano po datumu.
-    """
     if date_str in _ODDS_BY_DATE_CACHE:
         return _ODDS_BY_DATE_CACHE[date_str]
     data = _get("/odds", {"date": date_str})
     items = data.get("response", []) or []
     dbg(f"Odds-by-date: items={len(items)}")
-    table = _collect_odds_from_items(items)
+    table = _collect_odds_table(items)
     _ODDS_BY_DATE_CACHE[date_str] = table
     return table
 
-# ================= FETCH LAYERS =================
+def odds_by_fixture(fid: int, date_hint: Optional[str]) -> Dict[str, Dict[str, float]]:
+    # 1) pokušaj fixture
+    data = _get("/odds", {"fixture": fid})
+    items = data.get("response", []) or []
+    if items:
+        table = _collect_odds_table(items)
+        m = table.get(fid) or {}
+        dbg(f"Odds fid={fid}: fixture-markets={len(m)}")
+        return m
+    # 2) fallback date
+    if date_hint:
+        by_date = _odds_by_date(date_hint)
+        m = by_date.get(fid) or {}
+        dbg(f"Odds fid={fid}: via date={date_hint} markets={len(m)}")
+        return m
+    dbg(f"Odds fid={fid}: no markets")
+    return {}
+
+# ========================= FETCH FIXTURES =========================
 def fixtures_by_date(date_str: str) -> List[Dict[str, Any]]:
     data = _get("/fixtures", {"date": date_str})
     resp = data.get("response") or []
     out = []
-    cnt_skipped = 0
+    skipped = 0
     for f in resp:
         fx = f.get("fixture",{}) or {}
+        lg = f.get("league",{}) or {}
         st = (fx.get("status") or {}).get("short","")
         if st in SKIP_STATUS:
-            cnt_skipped += 1
+            skipped += 1
             continue
+        # Ticket 1 preferira ALLOW_IDS, Ticket 2 može koristiti sve
         out.append(f)
         if len(out) >= MAX_MATCHES:
             break
-    dbg(f"Fixtures: total={len(resp)} usable={len(out)} skipped={cnt_skipped}")
+    dbg(f"Fixtures: total={len(resp)} usable={len(out)} skipped={skipped}")
     return out
 
-def odds_by_fixture(fid: int, date_hint: Optional[str] = None) -> Dict[str, Dict[str, float]]:
-    """
-    1) Pokuša /odds?fixture=FID
-    2) Ako prazno i date_hint zadat: koristi /odds?date=DATE pa izdvoji fid
-    """
-    data = _get("/odds", {"fixture": fid})
-    items = data.get("response", []) or []
-    if items:
-        table = _collect_odds_from_items(items)
-        m = table.get(fid) or {}
-        dbg(f"Odds fid={fid}: via fixture, markets={len(m)}")
-        return m
-
-    dbg(f"Odds fid={fid}: empty via fixture; trying date fallback")
-    if date_hint:
-        all_by_date = _odds_by_date(date_hint)
-        m = all_by_date.get(fid) or {}
-        dbg(f"Odds fid={fid}: via date={date_hint}, markets={len(m)}")
-        return m
-
-    dbg(f"Odds fid={fid}: no markets and no date_hint")
-    return {}
-
-# ================= PICK LOGIC =================
-def _pick_in_band(odds_map: Dict[str, Dict[str, float]], spec: Tuple[str,str], lo: float, hi: float):
-    mkt,name = spec
-    v = (odds_map.get(mkt) or {}).get(name)
-    if v is None:
-        return None
-    v = float(v)
-    if lo <= v <= hi:
-        return (mkt, name, v)
-    return None
-
-def _best_from_bands(odds_map: Dict[str, Dict[str, float]], bands: Dict[Tuple[str,str], Tuple[float,float]]):
-    best = None; best_odd = 0.0
-    for (mkt,name),(lo,hi) in bands.items():
-        p = _pick_in_band(odds_map,(mkt,name),lo,hi)
-        if p and p[2] > best_odd:
-            best, best_odd = p, p[2]
-    return best
-
-def _best_from_caps(odds_map: Dict[str, Dict[str, float]], caps: Dict[Tuple[str,str], float]):
-    best = None; best_odd = 0.0
-    for (mkt,name),cap in caps.items():
-        v = (odds_map.get(mkt) or {}).get(name)
-        if v is None:
-            continue
-        v = float(v)
-        if v <= cap and v > best_odd:
-            best, best_odd = (mkt,name,v), v
-    return best
+# ========================= UTIL =========================
+def _product(vals: List[float]) -> float:
+    p=1.0
+    for v in vals: p*=v
+    return p
 
 def _ticket_line(f: Dict[str,Any], pick: Tuple[str,str,float]) -> Dict[str,Any]:
     fx = f.get("fixture",{}) or {}
@@ -293,201 +422,238 @@ def _ticket_line(f: Dict[str,Any], pick: Tuple[str,str,float]) -> Dict[str,Any]:
         "season": lg.get("season"),
         "home_id": (tm.get("home") or {}).get("id"),
         "away_id": (tm.get("away") or {}).get("id"),
+        "country": (lg.get("country") or ""),
     }
 
-def _sort_desc_by_odd(legs: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    return sorted(legs, key=lambda L: L["odd"], reverse=True)
+def _pick_in_band(odds_map: Dict[str, Dict[str, float]], spec: Tuple[str,str], lo: float, hi: float):
+    mkt,name = spec
+    v = (odds_map.get(mkt) or {}).get(name)
+    if v is None: return None
+    v=float(v)
+    if lo <= v <= hi: return (mkt,name,v)
+    return None
 
-# ================= ASSEMBLERS =================
-def assemble_ticket1_legs(date_str: str) -> List[Dict[str,Any]]:
-    legs: List[Dict[str,Any]] = []
-    all_fx = fixtures_by_date(date_str)
+def _best_from_bands(odds_map: Dict[str, Dict[str, float]], bands: Dict[Tuple[str,str], Tuple[float,float]]):
+    best=None; best_odd=0.0
+    for (mkt,name),(lo,hi) in bands.items():
+        p=_pick_in_band(odds_map,(mkt,name),lo,hi)
+        if p and p[2] > best_odd:
+            best, best_odd = p, p[2]
+    return best
 
-    today_ids = sorted({ int((f.get("league") or {}).get("id", 0)) for f in all_fx if (f.get("league") or {}).get("id") })
-    dbg(f"Today league.ids present: {today_ids[:60]} ...")
+def _best_from_caps(odds_map: Dict[str, Dict[str, float]], caps: Dict[Tuple[str,str], float]):
+    best=None; best_odd=0.0
+    for (mkt,name),cap in caps.items():
+        v=(odds_map.get(mkt) or {}).get(name)
+        if v is None: continue
+        v=float(v)
+        if v <= cap and v > best_odd:
+            best, best_odd = (mkt,name,v), v
+    return best
 
-    # prvo prioritetne lige i lige čiji id je u ALLOW_IDS
-    prio: List[Dict[str,Any]] = []
-    rest: List[Dict[str,Any]] = []
-    for f in all_fx:
-        lg = f.get("league") or {}
-        cid = int(lg.get("id", 0) or 0)
-        country = lg.get("country", "")
-        name = lg.get("name", "")
-        in_prio = (country, name) in PREFERRED_LEAGUES
-        in_allow = cid in ALLOW_IDS
-        if in_prio or in_allow:
-            prio.append(f)
-        else:
-            rest.append(f)
+# ========================= ASSEMBLY: T1 i T2 =========================
+def assemble_ticket1(date_str: str) -> Dict[str, Any]:
+    # Ticket 1: samo iz ALLOW_IDS i MARKET_BANDS; ako nema, probaj RELAXED_BANDS
+    fixtures = fixtures_by_date(date_str)
+    # Prvo izdvoji samo allow-lige
+    allow_fixtures = [f for f in fixtures if (f.get("league") or {}).get("id") in ALLOW_IDS]
+    dbg(f"T1 scan_order: prio={len(allow_fixtures)} rest={len(fixtures)-len(allow_fixtures)} total={len(fixtures)}")
 
-    scan = prio + rest
-    dbg(f"T1 scan_order: prio={len(prio)} rest={len(rest)} total={len(scan)}")
+    pool: List[Dict[str,Any]] = []
+    # 1) Prioritet: allow
+    for f in allow_fixtures:
+        fx=f.get("fixture",{}) or {}
+        fid=int(fx.get("id"))
+        odds = odds_by_fixture(fid, date_str)
+        pick = _best_from_bands(odds, MARKET_BANDS)
+        if pick:
+            pool.append(_ticket_line(f, pick))
 
-    for f in scan:
-        fid = int((f.get("fixture") or {}).get("id",0)) or 0
-        if not fid:
-            continue
-        o = odds_by_fixture(fid, date_hint=date_str)
-        p = _best_from_bands(o, MARKET_BANDS)
-        if p:
-            legs.append(_ticket_line(f, p))
-        else:
-            dbg(f"T1 skip fid={fid} reason=band_miss league_id={(f.get('league') or {}).get('id')} markets={list(o.keys())[:5]}")
+    # 2) Ako nedovoljno, probaj RELAXED_BANDS na allow
+    if len(pool) < LEGS_MIN:
+        for f in allow_fixtures:
+            fx=f.get("fixture",{}) or {}
+            fid=int(fx.get("id"))
+            odds = odds_by_fixture(fid, date_str)
+            pick = _best_from_bands(odds, RELAXED_BANDS)
+            if pick:
+                pool.append(_ticket_line(f, pick))
 
-    if not legs:
-        dbg("T1 no legs -> RELAXED_BANDS applied")
-        for f in scan:
-            fid = int((f.get("fixture") or {}).get("id",0)) or 0
-            if not fid:
+    # 3) Ako i dalje nema, pusti sve lige sa basic bandovima
+    if len(pool) < LEGS_MIN:
+        for f in fixtures:
+            if f in allow_fixtures: 
                 continue
-            o = odds_by_fixture(fid, date_hint=date_str)
-            p = _best_from_bands(o, RELAXED_BANDS)
-            if p:
-                legs.append(_ticket_line(f, p))
+            fx=f.get("fixture",{}) or {}
+            fid=int(fx.get("id"))
+            odds = odds_by_fixture(fid, date_str)
+            pick = _best_from_bands(odds, MARKET_BANDS)
+            if pick:
+                pool.append(_ticket_line(f, pick))
 
-    legs = _sort_desc_by_odd(legs)
-    dbg(f"T1 legs found={len(legs)}")
-    return legs
+    # 4) Kao poslednja šansa, sve lige + RELAXED_BANDS
+    if len(pool) < LEGS_MIN:
+        for f in fixtures:
+            fx=f.get("fixture",{}) or {}
+            fid=int(fx.get("id"))
+            odds = odds_by_fixture(fid, date_str)
+            pick = _best_from_bands(odds, RELAXED_BANDS)
+            if pick:
+                pool.append(_ticket_line(f, pick))
 
-def assemble_ticket2_legs(date_str: str) -> List[Dict[str,Any]]:
-    legs: List[Dict[str,Any]] = []
-    all_fx = fixtures_by_date(date_str)
-    dbg(f"T2 scan all leagues: {len(all_fx)} fixtures")
+    pool = sorted(pool, key=lambda L: L["odd"], reverse=True)
 
-    for f in all_fx:
-        fid = int((f.get("fixture") or {}).get("id",0)) or 0
-        if not fid:
-            continue
-        o = odds_by_fixture(fid, date_hint=date_str)
-        p = _best_from_caps(o, ALLOW_ALL_CAPS)
-        if p:
-            legs.append(_ticket_line(f, p))
-        else:
-            dbg(f"T2 skip fid={fid} reason=no FH0.5/TTG<=caps")
-
-    if not legs:
-        dbg("T2 no legs -> RELAXED_CAPS applied")
-        for f in all_fx:
-            fid = int((f.get("fixture") or {}).get("id",0)) or 0
-            if not fid:
-                continue
-            o = odds_by_fixture(fid, date_hint=date_str)
-            p = _best_from_caps(o, RELAXED_CAPS)
-            if p:
-                legs.append(_ticket_line(f, p))
-
-    legs = _sort_desc_by_odd(legs)
-    dbg(f"T2 legs found={len(legs)}")
-    return legs
-
-# ================= BUILDER =================
-def _format_ticket_text(idx: int, legs: List[Dict[str,Any]], total: float) -> str:
-    head = f"🎫 Ticket #{idx}\n"
-    lines = []
-    for L in legs:
-        lines.append("\n".join([L["league"], f"🆔 {L['fid']}", L["teams"], L["time"], L["pick"]]))
-    body = "\n\n".join(lines)
-    tail = f"\n\n🧮 Total odds: {total:.2f}"
-    return head + body + tail
-
-def _build_ticket(idx: int, target: float, pool: List[Dict[str,Any]], used: set):
-    legs: List[Dict[str,Any]] = []
+    ticket: List[Dict[str,Any]] = []
     total = 1.0
-    for L in pool:
-        if L["fid"] in used:
-            continue
-        legs.append(L); total *= L["odd"]
+    for leg in pool:
+        # ne preteruj dužinu
+        if len(ticket) >= LEGS_MAX:
+            break
+        trial_total = total * leg["odd"]
+        ticket.append(leg)
+        total = trial_total
+        if len(ticket) >= LEGS_MIN and total >= 2.0:
+            break
 
-        while len(legs) > LEGS_MAX:
-            legs.sort(key=lambda x: x["odd"])
-            removed = legs.pop(0)
-            total = math.prod([x["odd"] for x in legs]) if legs else 1.0
-            dbg(f"T{idx} trim removed fid={removed['fid']} new_total={total:.2f}")
+    if len(ticket) < LEGS_MIN:
+        dbg("T1 not built: insufficient legs")
+        return {"legs": [], "total": 1.0, "title": "🎟 Ticket #1 — band", "text": ""}
 
-        if len(legs) >= LEGS_MIN and total >= target:
-            used.update(x["fid"] for x in legs)
-            dbg(f"T{idx} BUILT len={len(legs)} total={total:.2f}")
-            return legs, round(total,2)
-    dbg(f"T{idx} not built: pool={len(pool)} legs_accum={len(legs)} total={total:.2f}")
-    return None, 1.0
+    text_lines = [
+        "🎟 Ticket #1 — Stabilni bandovi",
+        f"📅 {date_str}",
+        "",
+    ]
+    for l in ticket:
+        text_lines += [l["league"], l["teams"], l["time"], l["pick"], ""]
+    text_lines.append(f"📈 Ukupno: {total:.2f}")
+    body = "\n".join(text_lines)
 
-# ================= OPENAI REASONING (optional) =================
-def _reasoning_openai(ticket_title: str, legs: List[Dict[str,Any]]) -> str:
-    if not OPENAI_KEY:
-        return "Key drivers:\n" + "\n".join(
-            f"- {L['teams']} — {L['market']} {L['pick_name']} @ {L['odd']:.2f}" for L in legs
-        )
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_KEY)
-        facts = [
-            {"fixture": L["teams"], "market": L["market"], "pick": L["pick_name"], "odd": L["odd"]}
-            for L in legs
-        ]
-        prompt = ("Write concise, neutral reasoning for a daily ticket. 3–6 bullets. "
-                  "Avoid promotional tone and certainty. Use only provided picks. No emojis.")
-        r = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
-            messages=[
-                {"role":"system","content": prompt},
-                {"role":"user","content": json.dumps({"ticket": ticket_title, "facts": facts}, ensure_ascii=False)},
-            ],
-            max_tokens=240, temperature=0.3,
-        )
-        return (r.choices[0].message.content or "").strip()
-    except Exception as e:
-        dbg(f"OpenAI reasoning error: {e}")
-        return "Key drivers:\n" + "\n".join(
-            f"- {L['teams']} — {L['market']} {L['pick_name']} @ {L['odd']:.2f}" for L in legs
-        )
+    dbg(f"T1 built legs={len(ticket)} total={total:.2f}")
+    return {"legs": ticket, "total": total, "title": "🎟 Ticket #1", "text": body}
 
-# ================= PUBLIC API =================
-def build_tickets_and_reasoning(date_str: str) -> Tuple[List[str], List[str]]:
+def assemble_ticket2_allow_all(date_str: str) -> Dict[str, Any]:
+    # Ticket 2: koristi samo cap-ove <= iz zahtevane liste; target ukupno ≥ 1.85
+    fixtures = fixtures_by_date(date_str)
+
+    # Kandidati iz HARD cap-ova
+    pool_hard: List[Dict[str,Any]] = []
+    for f in fixtures:
+        fx=f.get("fixture",{}) or {}
+        fid=int(fx.get("id"))
+        odds = odds_by_fixture(fid, date_str)
+        pick = _best_from_caps(odds, ALLOW_ALL_CAPS_HARD)
+        if pick:
+            pool_hard.append(_ticket_line(f, pick))
+
+    # Ako nema, probaj RELAX caps
+    pool: List[Dict[str,Any]] = pool_hard[:]
+    if not pool:
+        for f in fixtures:
+            fx=f.get("fixture",{}) or {}
+            fid=int(fx.get("id"))
+            odds = odds_by_fixture(fid, date_str)
+            pick = _best_from_caps(odds, ALLOW_ALL_CAPS_RELAX)
+            if pick:
+                pool.append(_ticket_line(f, pick))
+
+    if not pool:
+        dbg("T2 no legs found at all")
+        return {"legs": [], "total": 1.0, "title": "🎟 Ticket #2 — allow-all", "text": ""}
+
+    pool = sorted(pool, key=lambda L: L["odd"])  # za target 1.85 koristi niže kvote prvo
+
+    ticket: List[Dict[str,Any]] = []
+    total = 1.0
+    for leg in pool:
+        if len(ticket) >= LEGS_MAX:
+            break
+        ticket.append(leg)
+        total *= leg["odd"]
+        if len(ticket) >= LEGS_MIN and total >= MIN_T2_TOTAL:
+            break
+
+    if total < MIN_T2_TOTAL or len(ticket) < LEGS_MIN:
+        # pokušaj dodavanja većih kvota iz ostatka kako bi gurnuo preko 1.85
+        for leg in sorted(pool, key=lambda L: L["odd"], reverse=True):
+            if leg in ticket:
+                continue
+            if len(ticket) >= LEGS_MAX:
+                break
+            ticket.append(leg)
+            total *= leg["odd"]
+            if total >= MIN_T2_TOTAL and len(ticket) >= LEGS_MIN:
+                break
+
+    if total < MIN_T2_TOTAL or len(ticket) < LEGS_MIN:
+        dbg(f"T2 not built: pool={len(pool)} legs={len(ticket)} total={total:.2f}")
+        return {"legs": [], "total": 1.0, "title": "🎟 Ticket #2 — allow-all", "text": ""}
+
+    text_lines = [
+        "🎟 Ticket #2 — Allow-all caps",
+        f"📅 {date_str}",
+        "",
+    ]
+    for l in ticket:
+        text_lines += [l["league"], l["teams"], l["time"], l["pick"], ""]
+    text_lines.append(f"📈 Ukupno: {total:.2f}")
+    body = "\n".join(text_lines)
+
+    dbg(f"T2 built legs={len(ticket)} total={total:.2f}")
+    return {"legs": ticket, "total": total, "title": "🎟 Ticket #2", "text": body}
+
+# ========================= PUBLIC API =========================
+def build_tickets_and_reasoning(date_str: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Glavna funkcija koju poziva main.py
+    Vraća: {"tickets":[{...},{...}], "messages":[str,...]}
+    """
+    if not date_str:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     dbg(f"=== build_tickets_and_reasoning date={date_str} ===")
-    # sanity check: pokušaj da vidiš ima li dnevnih kvota
-    try:
-        _ = _odds_by_date(date_str)
-    except Exception as e:
-        dbg(f"ODDS endpoint error: {e}")
 
-    used: set[int] = set()
-    tickets_texts: List[str] = []
-    reasonings: List[str] = []
+    t1 = assemble_ticket1(date_str)
+    t2 = assemble_ticket2_allow_all(date_str)
 
-    # Ticket #1 → target 2.00
-    legs1 = assemble_ticket1_legs(date_str)
-    t1, tot1 = _build_ticket(1, 2.00, legs1, used)
-    if t1:
-        tickets_texts.append(_format_ticket_text(1, t1, tot1))
-        reasonings.append(_reasoning_openai("Ticket #1", t1))
-    else:
-        dbg("Ticket #1 not generated")
+    tickets = [t for t in (t1, t2) if t.get("legs")]
+    msgs = [t["text"] for t in tickets]
+    dbg(f"RESULT tickets={len(tickets)}")
+    return {"tickets": tickets, "messages": msgs}
 
-    # Ticket #2 → target 1.85
-    legs2 = assemble_ticket2_legs(date_str)
-    legs2 = [L for L in legs2 if L["fid"] not in used]
-    t2, tot2 = _build_ticket(2, 1.85, legs2, used)
-    if t2:
-        tickets_texts.append(_format_ticket_text(2, t2, tot2))
-        reasonings.append(_reasoning_openai("Ticket #2", t2))
-    else:
-        dbg("Ticket #2 not generated")
-
-    dbg(f"RESULT tickets={len(tickets_texts)}")
-    return tickets_texts, reasonings
-
-def post_to_telegram(message: str, channel: str) -> Tuple[bool, Dict[str,Any]]:
-    if not TELE_BOT:
-        return False, {"reason": "TELEGRAM_BOT_TOKEN not configured"}
-    url = f"https://api.telegram.org/bot{TELE_BOT}/sendMessage"
-    _sleep()
+# ========================= TELEGRAM =========================
+def _telegram_send_text(bot_token: str, chat: str, text: str) -> Dict[str,Any]:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     with httpx.Client(timeout=30) as c:
-        r = c.post(url, data={"chat_id": channel, "text": message})
-        ok = 200 <= r.status_code < 300
+        r = c.post(url, json=payload)
         try:
-            data = r.json()
+            r.raise_for_status()
         except Exception:
-            data = {"status": r.status_code, "text": r.text[:200]}
-    dbg(f"Telegram send channel={channel} ok={ok}")
-    return ok, data
+            dbg(f"Telegram error chat={chat} status={r.status_code} text={r.text[:300]}")
+            raise
+        return r.json()
+
+def post_to_telegram(messages: List[str], channels: Optional[List[str]] = None) -> List[Dict[str,Any]]:
+    if channels is None or not channels:
+        channels = TELE_CHANS
+    if not TELE_BOT or not channels:
+        dbg("Telegram posting skipped: missing bot token or channels")
+        return []
+    out=[]
+    for m in messages:
+        for ch in channels:
+            try:
+                out.append(_telegram_send_text(TELE_BOT, ch, m))
+            except Exception as e:
+                dbg(f"Telegram send failed to {ch}: {e}")
+    return out
+
+# ========================= CLI run (manual) =========================
+if __name__ == "__main__":
+    date_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    res = build_tickets_and_reasoning(date_arg)
+    sent_payloads=[]
+    if res["messages"]:
+        sent_payloads = post_to_telegram(res["messages"], TELE_CHANS)
+    summary = {"sent": [bool(x.get("ok")) for x in sent_payloads], "tickets": len(res["tickets"])}
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
