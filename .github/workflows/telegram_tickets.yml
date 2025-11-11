@@ -34,6 +34,7 @@ jobs:
           LEGS_MAX: 6
           MAX_MATCHES: 180
           QPS_DELAY: 0.35
+          DEBUG: "1"
         run: |
           echo "=== Starting Telegram Tickets Workflow ==="
           python main.py 2>&1 | tee tickets_debug.log
