@@ -110,14 +110,14 @@ ALLOW_IDS: set[int] = resolve_allow_ids()
 
 # ===== Markets =====
 MARKET_BANDS = {
-    ("Double Chance","1X"): (1.20, 1.45),
-    ("Double Chance","X2"): (1.20, 1.45),
-    ("Over/Under","Over 1.5"): (1.20, 1.55),
-    ("Over/Under","Under 3.5"): (1.20, 1.60),
-    ("Over/Under","Over 2.5"): (1.60, 2.20),
-    ("Both Teams To Score","Yes"): (1.55, 2.05),
-    ("Match Winner","Home"): (1.35, 1.80),
-    ("Match Winner","Away"): (1.40, 1.90),
+    ("Double Chance","1X"): (1.20, 1.35),
+    ("Double Chance","X2"): (1.20, 1.35),
+    ("Over/Under","Over 1.5"): (1.20, 1.35),
+    ("Over/Under","Under 3.5"): (1.20, 1.40),
+    ("Over/Under","Over 2.5"): (1.30, 1.55),
+    ("Both Teams To Score","Yes"): (1.35, 1.55),
+    ("Match Winner","Home"): (1.35, 1.55),
+    ("Match Winner","Away"): (1.40, 1.60),
 }
 RELAXED_BANDS = {k: (max(1.10, lo-0.05), hi+0.25) for k,(lo,hi) in MARKET_BANDS.items()}
 
