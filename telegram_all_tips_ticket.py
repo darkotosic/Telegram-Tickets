@@ -46,12 +46,27 @@ def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     if key in _http_cache:
         return _http_cache[key]
     _sleep()
-    with _client() as c:
-        r = c.get(path, params=params)
-        r.raise_for_status()
-        data = r.json()
-        _http_cache[key] = data
-        return data
+    try:
+        with _client() as c:
+            r = c.get(path, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+            # API sometimes returns a 200 with an embedded error payload. Surface it clearly
+            # so the caller (or CI logs) show a direct hint about the missing/invalid token.
+            errs = data.get("errors") if isinstance(data, dict) else None
+            if errs:
+                raise RuntimeError(f"API error response: {errs}")
+
+            _http_cache[key] = data
+            return data
+    except httpx.HTTPStatusError as exc:
+        body = None
+        try:
+            body = exc.response.json()
+        except Exception:
+            body = exc.response.text
+        raise RuntimeError(f"HTTP error {exc.response.status_code} for {path}: {body}") from exc
 
 def _fmt_dt_local(iso_str: str) -> str:
     try:
