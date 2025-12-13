@@ -112,15 +112,24 @@ def _leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
     return out
 
 def resolve_allow_ids() -> set[int]:
-    ids: set[int] = set()
-    for country, name in sorted(PREFERRED_LEAGUES):
-        res = _leagues_search(name, country)
-        if not res:
-            dbg(f"RESOLVE miss: {country} — {name}")
-        for r in res:
-            if r["id"]:
-                ids.add(int(r["id"]))
-    ids |= {int(x) for x in ALLOW_LIST_STATIC}
+    ids: set[int] = {int(x) for x in ALLOW_LIST_STATIC}
+
+    if not API_KEY:
+        dbg("ALLOW_IDS using static list because API key is missing")
+        return ids
+
+    try:
+        for country, name in sorted(PREFERRED_LEAGUES):
+            res = _leagues_search(name, country)
+            if not res:
+                dbg(f"RESOLVE miss: {country} — {name}")
+            for r in res:
+                if r.get("id"):
+                    ids.add(int(r["id"]))
+    except httpx.HTTPError as exc:
+        dbg(f"ALLOW_IDS falling back to static list due to API failure: {exc}")
+        return ids
+
     dbg(f"ALLOW_IDS resolved total={len(ids)} sample={sorted(list(ids))[:40]}")
     return ids
 
