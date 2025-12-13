@@ -129,6 +129,9 @@ def resolve_allow_ids() -> set[int]:
     except httpx.HTTPError as exc:
         dbg(f"ALLOW_IDS falling back to static list due to API failure: {exc}")
         return ids
+    except Exception as exc:
+        dbg(f"ALLOW_IDS falling back to static list due to unexpected error: {exc}")
+        return ids
 
     dbg(f"ALLOW_IDS resolved total={len(ids)} sample={sorted(list(ids))[:40]}")
     return ids
